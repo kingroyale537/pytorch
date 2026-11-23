@@ -381,7 +381,8 @@ def is_b2b_gemm_good_on(
     if any(is_bf16x9_matmul(t.device.type, t.dtype) for t in fake_tensors):
         return False
 
-    # Match use_triton_template: GPU-class + Triton templates (excludes MPS).
+    # Same device/backend gate as use_triton_template's GPU branch
+    # (GPU-class + TRITON_TEMPLATES; excludes MPS).
     if not all(
         is_gpu(t.device.type)
         and has_backend_feature(t.device, BackendFeature.TRITON_TEMPLATES)
