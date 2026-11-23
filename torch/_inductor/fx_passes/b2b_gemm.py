@@ -24,6 +24,7 @@ from ..pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
+from ..codegen.common import BackendFeature, has_backend_feature
 from ..select_algorithm import (
     autotune_select_algorithm,
     SymbolicGridFn,
@@ -380,7 +381,12 @@ def is_b2b_gemm_good_on(
     if any(is_bf16x9_matmul(t.device.type, t.dtype) for t in fake_tensors):
         return False
 
-    if not all(is_gpu(t.device.type) for t in fake_tensors):
+    # Match use_triton_template: GPU-class + Triton templates (excludes MPS).
+    if not all(
+        is_gpu(t.device.type)
+        and has_backend_feature(t.device, BackendFeature.TRITON_TEMPLATES)
+        for t in fake_tensors
+    ):
         return False
     if not all([len(A.shape) == 2, len(B.shape) == 2, len(C.shape) == 2]):
         return False
