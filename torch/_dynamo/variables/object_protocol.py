@@ -74,6 +74,7 @@ from .base import (
     NO_SUCH_SUBOBJ,
     readonly_setter,
     type_qualified_name,
+    ValueMutationNew,
     VariableTracker,
 )
 from .constant import ConstantVariable
@@ -3031,6 +3032,12 @@ def object_generic_setattr_str(
                         "reload it from.",
                         hints=[*graph_break_hints.SUPPORTABLE],
                     )
+            if type(obj) is variables.OrderedDictVariable and not isinstance(
+                obj.mutation_type, ValueMutationNew
+            ):
+                obj.unsupported_instance_state(
+                    "attribute mutation on an input OrderedDict"
+                )
             if obj.is_tensor() or isinstance(obj, variables.PythonModuleVariable):
                 # handle_traced_output leaves aliased Tensor outputs untracked
                 # (repeated objects, returned inputs): replaying onto them as
