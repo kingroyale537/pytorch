@@ -4505,7 +4505,11 @@ class InstructionTranslatorBase(
                 py_type = realized.python_type()
             except NotImplementedError:
                 py_type = None
-            if py_type is not None and py_type.__format__ is object.__format__:
+            if (
+                py_type is not None
+                and py_type.__format__ is object.__format__
+                and not BuiltinVariable.has_pending_format_mutation(self, realized)
+            ):
                 try:
                     from .variables.object_protocol import generic_str
 
@@ -4520,7 +4524,7 @@ class InstructionTranslatorBase(
             self, "{:" + fmt_spec.as_python_constant() + "}"
         )
 
-        format_fn = VariableTracker.build(self, str.format)
+        format_fn = SourcelessBuilder.create_internal_builtin(str.format)
         self.call_function(format_fn, [fmt_var, value], {})
 
     @break_graph_if_unsupported(

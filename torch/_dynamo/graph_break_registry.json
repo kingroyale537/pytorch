@@ -3346,6 +3346,16 @@
       ]
     }
   ],
+  "GB1551": [
+    {
+      "Gb_type": "Builtin method operation requires identity guards",
+      "Context": "context",
+      "Explanation": "Dynamo cannot establish the stable receiver identity required by this operation.",
+      "Hints": [
+        "Bind the method inside the compiled function or pass the computed result as an input."
+      ]
+    }
+  ],
   "GB0176": [
     {
       "Gb_type": "call_id() without associated real value",
@@ -4167,6 +4177,16 @@
       "Explanation": "The type {self.python_type_name()} has an sq_inplace_repeat C slot but the corresponding VariableTracker doesn't implement sq_inplace_repeat_impl.",
       "Hints": [
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB7856": [
+    {
+      "Gb_type": "dict storage mutation on OrderedDict",
+      "Context": "dict.{name}",
+      "Explanation": "Base dict writes bypass OrderedDict's linked storage.",
+      "Hints": [
+        "Use OrderedDict methods to preserve its linked storage."
       ]
     }
   ],
@@ -5491,6 +5511,16 @@
       "Explanation": "The attribute '{name}' does not exist on opaque class {self.value}.",
       "Hints": [
         "Ensure '{name}' is a valid attribute of {type(self.value)}."
+      ]
+    }
+  ],
+  "GB8756": [
+    {
+      "Gb_type": "Conversion of compile-time-only hash value",
+      "Context": "identity-dependent hash",
+      "Explanation": "An identity-dependent hash cannot be converted to a constant result.",
+      "Hints": [
+        "Compute the hash outside the compiled function."
       ]
     }
   ],
@@ -7511,6 +7541,16 @@
       "Explanation": "Dynamo cannot safely replay global deletes for a frame whose globals dict is not the registered module __dict__.",
       "Hints": [
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB3943": [
+    {
+      "Gb_type": "Unsupported user-defined formatting",
+      "Context": "{value.python_type_name()}.__format__, pending class mutation: {mutated}",
+      "Explanation": "Dynamo cannot safely specialize this object's formatting behavior.",
+      "Hints": [
+        "Format this value outside the compiled region."
       ]
     }
   ]
