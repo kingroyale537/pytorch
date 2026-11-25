@@ -7643,5 +7643,16 @@
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
+  ],
+  "GB4121": [
+    {
+      "Gb_type": "Iterator reconstruction before an input mutation",
+      "Context": "str(container.source)",
+      "Explanation": "Reconstructing the iterator before pending mutations are replayed could change which elements it sees.",
+      "Hints": [
+        "Create the iterator after returning from the compiled function.",
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
   ]
 }

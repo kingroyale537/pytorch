@@ -333,6 +333,8 @@ class SideEffects:
         # Sources mutated during tracing: AttrSource for attribute
         # mutations, var.source for value mutations (list/dict/etc).
         self.mutated_sources: OrderedSet[Source] = OrderedSet()
+        # An escaping namespace iterator must see any aliased dictionary writes.
+        self.mutated_dict_sources: OrderedSet[Source] = OrderedSet()
 
         # Deferred side-effect checking for nullified attribute mutations.
         # Maps (vt_id, attr_name) → (original_value, current_value).
@@ -471,7 +473,7 @@ class SideEffects:
         ref = self.output_graph_weakref()
         if ref is None:
             raise AssertionError("output_graph weakref is dead during clone")
-        return self.__class__(
+        clone = self.__class__(
             output_graph=ref,
             id_to_variable=dict(self.id_to_variable),
             store_attr_mutations={
@@ -485,6 +487,8 @@ class SideEffects:
             save_for_backward=self.save_for_backward,
             tensor_hooks=self.tensor_hooks,
         )
+        clone.mutated_dict_sources = self.mutated_dict_sources.copy()
+        return clone
 
     def __contains__(self, item: object) -> bool:
         return id(item) in self.id_to_variable
@@ -1200,6 +1204,8 @@ class SideEffects:
             var.mutation_type.is_modified = True
         if var.source is not None:
             self.mutated_sources.add(var.source)
+            if isinstance(var, variables.ConstDictVariable):
+                self.mutated_dict_sources.add(var.source)
 
     def _get_modified_vars(self) -> list[VariableTracker]:
         return [var for var in self.id_to_variable.values() if self.is_modified(var)]

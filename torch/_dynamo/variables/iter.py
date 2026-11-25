@@ -14,11 +14,12 @@ handling of iterator operations during code transformation and optimization.
 """
 
 import collections
+import functools
 import inspect
 import itertools
 import operator
 import sys
-from typing import Any, TYPE_CHECKING
+from typing import Any, cast, TYPE_CHECKING
 
 from .. import config, graph_break_hints, polyfills, variables
 from ..bytecode_transformation import (
@@ -35,8 +36,16 @@ from ..exc import (
     TorchDynamoException,
     unimplemented,
 )
+from ..guards import _method_identity_guards_filtered, GuardBuilder, install_guard
+from ..source import (
+    GlobalSource,
+    is_from_global_source,
+    is_from_local_source,
+    is_from_skip_guard_source,
+    LocalSource,
+)
 from ..utils import raise_args_mismatch, tracked_repr, unpack_iterable
-from .base import Method, ValueMutationNew, VariableTracker
+from .base import Method, ValueMutationExisting, ValueMutationNew, VariableTracker
 from .constant import ConstantVariable
 from .hashable import HashableTracker, ordered_key_iteration
 from .object_protocol import generic_getiter, pyiter_next
@@ -426,6 +435,8 @@ class ChainVariable(IteratorVariable):
 
 
 class RepeatIteratorVariable(IteratorVariable):
+    _cpython_type = itertools.repeat
+
     # ref: https://github.com/python/cpython/blob/3.13/Modules/itertoolsmodule.c
     # repeat carries a `cnt` count: -1 means unbounded; CPython's repeat_new
     # clamps a user-supplied negative `times` to 0. We model that with `times`
@@ -512,6 +523,8 @@ class RepeatIteratorVariable(IteratorVariable):
 
 
 class CountIteratorVariable(IteratorVariable):
+    _cpython_type = itertools.count
+
     # advance_count tracks how many next() calls were made during tracing,
     # used by side_effects.py to replay them on the real iterator post-execution.
     _nonvar_fields = {
@@ -954,6 +967,8 @@ class DictViewIterator(IteratorVariable):
 
     _nonvar_fields = {
         "view_type",
+        "reverse",
+        "_initial_size",
         *IteratorVariable._nonvar_fields,
     }
 
@@ -966,10 +981,14 @@ class DictViewIterator(IteratorVariable):
         *,
         view_type: str,
         reverse: bool = False,
+        owner: VariableTracker | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.view_type = view_type
+        self.reverse = reverse
+        self.owner = owner
+        self._initial_size = len(items)
         if not self.linked_order and isinstance(items, dict):
             view = getattr(dict, view_type)(items)
         else:
@@ -978,15 +997,126 @@ class DictViewIterator(IteratorVariable):
 
     @classmethod
     def create(
-        cls, items: dict[HashableTracker, VariableTracker], *, ordered: bool = False
+        cls,
+        items: dict[HashableTracker, VariableTracker],
+        *,
+        ordered: bool = False,
+        owner: VariableTracker | None = None,
     ) -> "DictViewIterator":
         iterator_cls = OrderedDictIterator if ordered else cls
-        return iterator_cls(items, view_type=cls.view_type)
+        return iterator_cls(items, view_type=cls.view_type, owner=owner)
+
+    @staticmethod
+    def _can_reconstruct(
+        tx: "InstructionTranslatorBase", container: VariableTracker
+    ) -> bool:
+        from .dicts import ConstDictVariable, DunderDictVariable
+        from .sets import BaseSetVariable
+
+        if not container.source:
+            return True
+        # Stack reconstruction precedes replay of mutations to a live input.
+        side_effects = tx.output.side_effects
+        if side_effects.is_modified(container):
+            return False
+        if container.python_type() is dict and any(
+            attrs and not isinstance(var, variables.CellVariable)
+            for var, attrs in side_effects.store_attr_mutations.items()
+        ):
+            # A dict input can alias an instance namespace or the globals on a cache hit.
+            return False
+        if isinstance(container, DunderDictVariable):
+            owner = container.items.item
+            modified_sources = side_effects.mutated_dict_sources
+            if modified_sources:
+                namespace = container.items.get_example_value_dict(owner)
+                if type(namespace) is not dict:
+                    return False
+                # Only read frame bindings here. Resolving an arbitrary attribute
+                # could invoke user code while checking for an alias.
+                frame = tx.output.root_tx
+                for src in modified_sources:
+                    if type(src) is LocalSource:
+                        binding = frame.f_locals.get(src.local_name)
+                    elif type(src) is GlobalSource:
+                        binding = frame.f_globals.get(src.global_name)
+                    else:
+                        return False
+                    if type(binding) is not dict or binding is namespace:
+                        return False
+        else:
+            modified_sources = (
+                var.source
+                for var in side_effects.id_to_variable.values()
+                if isinstance(var, (ConstDictVariable, BaseSetVariable))
+                and isinstance(var.mutation_type, ValueMutationExisting)
+                and var.mutation_type.is_modified
+                and var.python_type() is container.python_type()
+                and var.source is not None
+            )
+        for source in modified_sources:
+            sources = (container.source, source)
+            if _method_identity_guards_filtered(tx) or any(
+                is_from_skip_guard_source(s)
+                or not (is_from_local_source(s) or is_from_global_source(s))
+                for s in sources
+            ):
+                return False
+            check = functools.partial(GuardBuilder.NOT_DUPLICATE_INPUT, source_b=source)
+            install_guard(container.make_guard(check))
+        return True
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        from .dicts import ConstDictVariable, DictKeysVariable, DictViewVariable
+        from .sets import BaseSetVariable
+
+        owner = self.owner
+        if owner is None:
+            return super().reconstruct(codegen)
+        container = owner.dv_dict if isinstance(owner, DictViewVariable) else owner
+        if not isinstance(container, (ConstDictVariable, BaseSetVariable)):
+            return super().reconstruct(codegen)
+        if not self._can_reconstruct(codegen.tx, container):
+            unimplemented(
+                gb_type="Iterator reconstruction before an input mutation",
+                context=str(container.source),
+                explanation="Reconstructing the iterator before pending mutations are replayed could change which elements it sees.",
+                hints=[
+                    "Create the iterator after returning from the compiled function.",
+                    *graph_break_hints.SUPPORTABLE,
+                ],
+            )
+        if len(container.items) != self._initial_size:
+            return super().reconstruct(codegen)
+        if self.linked_order:
+            try:
+                # A move can invalidate an OrderedDict iterator without changing its size.
+                with ordered_key_iteration("identity"):
+                    self._iter.__reduce__()
+            except RuntimeError:
+                return super().reconstruct(codegen)
+        if isinstance(owner, ConstDictVariable):
+            owner = DictKeysVariable.create(owner, is_ordered=self.linked_order)
+        if isinstance(owner, (variables.SetVariable, variables.FrozensetVariable)):
+            base = "set" if isinstance(owner, variables.SetVariable) else "frozenset"
+
+            def load_iter() -> None:
+                codegen.load_import_from("builtins", base)
+                codegen.append_output(codegen.create_load_attr("__iter__"))
+
+            codegen.add_push_null(load_iter)
+        else:
+            method = "reversed" if self.reverse else "iter"
+            codegen.add_push_null(lambda: codegen.load_import_from("builtins", method))
+        codegen(owner)
+        codegen.extend_output(create_call_function(1, False))
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
         # dictiter_iternextitem: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c#L5538-L5578
         # dictiter_iternextkey: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c#L5125-L5144
         # dictiter_iternextvalue: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c#L5248-L5267
+        # Reconstruct only fresh iterators, whose cursor is still at the beginning.
+        self.owner = None
         try:
             if self.linked_order:
                 with ordered_key_iteration("trace"):
@@ -1067,8 +1197,12 @@ class OrderedDictIterator(DictViewIterator):
     view_type = "items"
 
     @classmethod
-    def create_reversed(cls, items, view_type: str) -> "OrderedDictIterator":
-        return cls(items, view_type=view_type, reverse=True)
+    def create_reversed(
+        cls, view: "variables.DictViewVariable"
+    ) -> "OrderedDictIterator":
+        return cls(
+            view.dv_dict.items, view_type=cast(str, view.kv), reverse=True, owner=view
+        )
 
     def python_type(self) -> type:
         return _ORDERED_DICT_ITERATOR_TYPE
@@ -1077,3 +1211,6 @@ class OrderedDictIterator(DictViewIterator):
 class SetIterator(DictViewIterator):
     _cpython_type = type(iter(set()))
     view_type = "keys"
+
+    def python_type(self) -> type:
+        return cast(type, self._cpython_type)
