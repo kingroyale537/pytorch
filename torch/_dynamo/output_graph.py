@@ -131,7 +131,7 @@ from .graph_id_filter import (
     get_inductor_config_override_for_compile_id,
 )
 from .graph_region_tracker import GraphRegionTracker
-from .guards import GuardBuilder, install_guard
+from .guards import _get_closure_vars, GuardBuilder, install_guard
 from .mutation_guard import is_dynamic_nn_module
 from .side_effects import (
     AttributeMutationExisting,
@@ -227,6 +227,7 @@ OutputReturnKind = Literal["graph_out", "input", "constant"]
 class SizesStridesInfo(TypedDict):
     size: TensorMetadataSequence
     stride: TensorMetadataSequence
+    needs_alias_check: NotRequired[bool]
     values_size: NotRequired[TensorMetadataSequence]
     values_stride: NotRequired[TensorMetadataSequence]
 
@@ -1748,6 +1749,15 @@ class OutputGraph(OutputGraphCommon):
             )
             self.tracers.append(tracer)
             yield tracer
+            # Successful ordinary HOP traces contribute to enclosing reuse conditions.
+            if tracer.parent is not None and tracer.parent.tracks_lexical_sources:
+                tracer.parent.has_container_identity |= tracer.has_container_identity
+                tracer.parent.traced_sources.update(tracer.traced_sources)
+                tracer.parent.lexical_sources.update(
+                    item
+                    for item in tracer.lexical_sources
+                    if item[1] <= tracer.parent.debug_level
+                )
         finally:
             new_scope_ctx.__exit__(None, None, None)
             self.tracers.pop()
@@ -1833,17 +1843,18 @@ class OutputGraph(OutputGraphCommon):
     def current_tx(self) -> "InstructionTranslatorBase":
         return self.root_tx if not self._current_tx else self._current_tx[-1]
 
-    def resolve_source_value(self, source: Source) -> Any:
+    def resolve_source_value(
+        self, source: Source, cache: dict[Source, Any] | None = None
+    ) -> Any:
         """
         Resolve the runtime value a Source points to using root_tx's frame.
 
-        Useful to inspect the python object associated with the source during
-        debugging. Will also be used by invoke subgraph caching later on.
+        Pass a shared cache to reuse intermediate values across nested region guard checks.
         """
         return source.get_value(
             {"G": self.root_tx.f_globals, "L": self.root_tx.f_locals},
-            {},
-            {},  # type: ignore[arg-type]
+            _get_closure_vars(),
+            {} if cache is None else cache,
         )
 
     def count_calls(self) -> int:
@@ -4264,6 +4275,7 @@ class SubgraphTracer(fx.Tracer):
         # map's keys give all current placeholder node names and can be used to
         # create unique node names
         self.input_name_to_proxy: dict[str, fx.Proxy] = {}
+        self.reused_subgraph_proxies: dict[str, fx.Proxy] = {}
         # Node => computed real value (see utils.get_real_value)
         self.real_value_cache: dict[fx.Node, torch.Tensor] = {}
         # [device-as-parameter] the single coor::current_device_index observation
@@ -4322,6 +4334,15 @@ class SubgraphTracer(fx.Tracer):
         # this subtracer's trace. Used by invoke_subgraph reuse to collect
         # guards and detect mutations on captured variables.
         self.traced_sources: OrderedSet[Source] = OrderedSet()
+        self.in_nested_compile_region = (
+            source_target is torch._higher_order_ops.invoke_subgraph
+            or (parent is not None and parent.in_nested_compile_region)
+        )
+        self.tracks_lexical_sources = (
+            parent is not None and parent.tracks_lexical_sources
+        )
+        self.lexical_sources: set[tuple[Source, int]] = set()
+        self.has_container_identity = False
         self.has_builtin_method_identity = False
 
         # True if this tracer is currently tracing (reconstructing) into a Python generator
