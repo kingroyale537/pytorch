@@ -6,8 +6,11 @@ import inspect
 import math
 import operator
 import os
+import re
 import sys
 import unittest
+
+import sympy
 
 import torch
 import torch.library
@@ -26,6 +29,7 @@ from torch.testing import FileCheck
 from torch.testing._internal.common_cuda import IS_SM89
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
+    largeTensorTest,
     onlyAccelerator,
     onlyCPU,
     preserves_device_selection,
@@ -425,6 +429,66 @@ if not TEST_WITH_ASAN:
                     )
 
     _reattach_markers_and_guards()
+
+
+@contextlib.contextmanager
+def _record_launches():
+    """Record (index dtype, size_hints) for every Triton kernel launched inside the
+    block. The index dtype ("i32" or "i64") is the type of the kernel's numel args."""
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+    launched: list[tuple[str, dict[str, int]]] = []
+    run = CachingAutotuner.run
+
+    def recording_run(self, *args, **kwargs):
+        signature = self.triton_meta["signature"]
+        dtypes = {t for name, t in signature.items() if name.endswith("numel")}
+        if dtypes:
+            (dtype,) = dtypes
+            launched.append((dtype, dict(self.size_hints)))
+        return run(self, *args, **kwargs)
+
+    with unittest.mock.patch.object(CachingAutotuner, "run", recording_run):
+        yield launched
+
+
+@contextlib.contextmanager
+def _record_tensor_args():
+    """Record the number of tensor args of every Triton kernel launched inside the
+    block."""
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+    counts: list[int] = []
+    run = CachingAutotuner.run
+
+    def recording_run(self, *args, **kwargs):
+        counts.append(sum(isinstance(arg, torch.Tensor) for arg in args))
+        return run(self, *args, **kwargs)
+
+    with unittest.mock.patch.object(CachingAutotuner, "run", recording_run):
+        yield counts
+
+
+_INT32_TEST_LIMIT = 64 * 1024
+
+
+@contextlib.contextmanager
+def _lowered_int32_limit():
+    """Make dual_index_dtype_kernels dispatch on `size <= 64K` instead of
+    `size <= 2**31 - 1`, so that small test inputs reach both the int32 and the int64
+    kernel."""
+    from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
+
+    int32_index_conditions = SIMDKernelFeatures.int32_index_conditions
+
+    def lowered(self):
+        conds = int32_index_conditions(self)
+        return conds and [sympy.Le(cond.lhs, _INT32_TEST_LIMIT) for cond in conds]
+
+    with unittest.mock.patch.object(
+        SIMDKernelFeatures, "int32_index_conditions", lowered
+    ):
+        yield
 
 
 class TestInductorDynamic(DynamicShapesTestCase):
@@ -984,9 +1048,11 @@ class TestInductorDynamic(DynamicShapesTestCase):
         self.assertEqual(orig_w, w.grad)
 
     @onlyAccelerator
-    @parametrize("mode", ["avoid_32bit_indexing_guards"])
+    @parametrize("mode", ["avoid_32bit_indexing_guards", "dual_index_dtype_kernels"])
     def test_split_scan_int64_index(self, device, mode):
-        """A split scan (cumsum over a long row) compiled with int64 indexing."""
+        """A split scan (cumsum over a long row) compiled with int64 indexing: the
+        int64 kernel from avoid_32bit_indexing_guards, or the int64 variant that
+        dual_index_dtype_kernels builds next to the int32 one."""
 
         def fn(x):
             return torch.cumsum(x, -1)
@@ -1012,6 +1078,261 @@ class TestInductorDynamic(DynamicShapesTestCase):
         guards = str(_debug_get_cache_entry_list(fn.__code__)[0].guard_manager)
         self.assertEqual("<= 2147483647" in guards, not avoid_guards)
         self.assertEqual("'xnumel': 'i64'" in code, avoid_guards)
+
+    def _assert_dual_launch(self, compiled, fn, args, max_numel):
+        """Run compiled(*args), check it matches fn(*args), and check that only the
+        expected kernels ran: the int32 ones if max_numel (the largest buffer size, in
+        elements) is at most _INT32_TEST_LIMIT, else the int64 ones."""
+        expected = fn(*args)
+        with _record_launches() as launched:
+            self.assertEqual(compiled(*args), expected)
+        side = "i32" if max_numel <= _INT32_TEST_LIMIT else "i64"
+        self.assertEqual({dtype for dtype, _ in launched}, {side})
+
+    @onlyAccelerator
+    @parametrize("cooperative", [False, True])
+    def test_dual_index_dtype_reductions(self, device, cooperative):
+        """With dual_index_dtype_kernels, a dynamic-shape reduction compiles once into
+        an int32 and an int64 kernel and launches the one that fits each input: no
+        recompile, correct results, and no 2**31 guard. To reach both kernels with small
+        inputs, the int32 limit is lowered from 2**31 to 64K elements (the generated
+        check becomes `size <= 65536`). cooperative=True repeats this with cooperative
+        reductions, whose two kernels share one scratch workspace."""
+
+        def fn(x):
+            return x.sum(-1), x.argmax(-1), torch.softmax(x, -1)
+
+        counter = CompileCounterWithBackend("inductor")
+        compiled = torch.compile(fn, backend=counter, dynamic=True)
+        with (
+            config.patch(
+                {
+                    "dual_index_dtype_kernels": True,
+                    "triton.force_cooperative_reductions": cooperative,
+                }
+            ),
+            _lowered_int32_limit(),
+        ):
+            x = torch.randn(64, 512, device=device)
+            actual, (code, *_) = run_and_get_code(compiled, x)
+            self.assertEqual(actual, fn(x))
+            # Both sides of the limit, in either order, without recompiling.
+            for shape in [(512, 512), (3, 7), (300, 1000), (64, 512)]:
+                y = torch.randn(shape, device=device)
+                self._assert_dual_launch(compiled, fn, (y,), y.numel())
+        self.assertEqual(counter.frame_count, 1)
+
+        if cooperative:
+            self.assertIn("RSPLIT", code)
+        (entry,) = _debug_get_cache_entry_list(fn.__code__)
+        self.assertNotIn("2147483647", str(entry.guard_manager))
+
+    @onlyAccelerator
+    @serialTest()
+    @largeTensorTest("3GB")  # measured peak: 2.25 GiB
+    @parametrize("dual", [False, True])
+    def test_dual_index_dtype_past_int32(self, device, dual):
+        """A real input past 2**31 elements, after compiling on a small one: without
+        dual_index_dtype_kernels the int32 kernel's size guard fails and the graph
+        recompiles; with it the int64 kernel runs, tuned for sizes past 2**31, and
+        nothing recompiles."""
+
+        def fn(x):
+            return x.sum(-1)
+
+        counter = CompileCounterWithBackend("inductor")
+        compiled = torch.compile(fn, backend=counter, dynamic=True)
+        with config.patch(dual_index_dtype_kernels=dual):
+            x = torch.randint(-3, 3, (64, 2**15), dtype=torch.int8, device=device)
+            self.assertEqual(compiled(x), fn(x))
+            # 2**31 + 2**15 elements: past the int32 range.
+            big = torch.randint(
+                -3, 3, (2**16 + 1, 2**15), dtype=torch.int8, device=device
+            )
+            # In chunks: eager sum upcasts int8 to int64, 16 GiB for all of big.
+            expected = torch.cat([chunk.sum(-1) for chunk in big.split(2**10)])
+            with _record_launches() as launched:
+                actual = compiled(big)
+            if dual:
+                # The int64 kernel runs, tuned for sizes past int32. (Smaller kernels,
+                # like the second stage of a split reduction on GPUs below sm100,
+                # run int32.)
+                self.assertIn("i64", {dtype for dtype, _ in launched})
+                for dtype, size_hints in launched:
+                    if dtype == "i64":
+                        self.assertGreaterEqual(math.prod(size_hints.values()), 2**31)
+            self.assertEqual(actual, expected)
+        # Without dual kernels, the int32 kernel's size guard fails and recompiles.
+        self.assertEqual(counter.frame_count, 1 if dual else 2)
+
+    @onlyAccelerator
+    def test_dual_index_dtype_int64_hints(self, device):
+        """The int64 kernel is tuned for the sizes at which it runs: its size_hints come
+        from the example's sizes scaled by the smallest power of two that exceeds the
+        int32 limit (64K here, see _lowered_int32_limit), so 64x512 becomes 128x1024.
+        The int32 kernel keeps the example's hints."""
+
+        def fn(x):
+            return x.sum(-1)
+
+        compiled = torch.compile(fn, dynamic=True)
+        with config.patch(dual_index_dtype_kernels=True), _lowered_int32_limit():
+            compiled(torch.randn(64, 512, device=device))
+            with _record_launches() as launched:
+                compiled(torch.randn(32, 512, device=device))
+            self.assertEqual(launched, [("i32", {"x": 64, "r0_": 512})])
+            with _record_launches() as launched:
+                compiled(torch.randn(256, 512, device=device))
+            self.assertEqual(launched, [("i64", {"x": 128, "r0_": 1024})])
+
+    @onlyAccelerator
+    @config.patch({"trace.provenance_tracking_level": 1, "force_disable_caches": True})
+    def test_dual_index_dtype_provenance(self, device):
+        """Provenance tracking records both the int32 and the int64 kernel of a dual
+        pair, each with its own debug handle."""
+        import torch._inductor.codegen.triton as triton_codegen
+        from torch._inductor import debug
+
+        def fn(x):
+            return x.sum(-1)
+
+        recorded: dict[str, list[str]] = {}
+        set_tracing = debug.set_kernel_post_grad_provenance_tracing
+
+        def recording(node_schedule, kernel_name, *args, **kwargs):
+            names = [n.get_name() for n in node_schedule if hasattr(n, "get_name")]
+            recorded[kernel_name] = names
+            return set_tracing(node_schedule, kernel_name, *args, **kwargs)
+
+        with (
+            debug.reset_provenance_globals(),
+            config.patch(dual_index_dtype_kernels=True),
+            unittest.mock.patch.object(
+                debug, "set_kernel_post_grad_provenance_tracing", recording
+            ),
+            unittest.mock.patch.object(
+                triton_codegen, "set_kernel_post_grad_provenance_tracing", recording
+            ),
+        ):
+            _, (code, *_) = run_and_get_code(
+                torch.compile(fn, dynamic=True), torch.randn(64, 512, device=device)
+            )
+        handles = re.findall(r"\[Provenance debug handles\] (\w+):\d+", code)
+        self.assertEqual(len(set(handles)), 2)
+        # Both kernels are mapped to the same nodes.
+        self.assertEqual(sorted(recorded), sorted(set(handles)))
+        (nodes0, nodes1) = recorded.values()
+        self.assertTrue(nodes0)
+        self.assertEqual(nodes0, nodes1)
+
+    @onlyAccelerator
+    def test_dual_index_dtype_same_buffers(self, device):
+        """The int32 and int64 kernels write the same buffers even when their hints
+        lead to different reduction choices. Forced here: only the kernel built with
+        the example's hints may be persistent. The looped one stores y and reloads it
+        after the amax, so it must keep y's buffer, which the persistent one would
+        remove; both then keep it."""
+        from torch._inductor.codegen.simd import SIMDScheduling
+        from torch._inductor.codegen.triton import TritonKernel
+
+        should_use_persistent_reduction = TritonKernel.should_use_persistent_reduction
+        union_must_keep_buffers = SIMDScheduling._union_must_keep_buffers
+        rebuilt_keeping = []
+
+        def recording_union(kernels):
+            keep = union_must_keep_buffers(kernels)
+            if keep is not None:
+                rebuilt_keeping.append(keep)
+            return keep
+
+        def with_example_hints_only(self):
+            if V.graph.sizevars.optimization_hint_overrides_key is not None:
+                return False
+            return should_use_persistent_reduction(self)
+
+        def fn(x):
+            y = x
+            for _ in range(40):  # enough ops that y is stored rather than recomputed
+                y = (y * 1.01 + 0.1).sin()
+            return y - y.amax(-1, keepdim=True), y.sum(-1)
+
+        compiled = torch.compile(fn)
+        with (
+            config.patch(dual_index_dtype_kernels=True),
+            _lowered_int32_limit(),
+            unittest.mock.patch.object(
+                TritonKernel, "should_use_persistent_reduction", with_example_hints_only
+            ),
+            unittest.mock.patch.object(
+                SIMDScheduling,
+                "_union_must_keep_buffers",
+                staticmethod(recording_union),
+            ),
+        ):
+            x = torch.randn(64, 512, device=device)
+            torch._dynamo.mark_dynamic(x, 0)
+            _, (code, *_) = run_and_get_code(compiled, x)
+            num_tensor_args = {}
+            for rows in [256, 3]:
+                y = torch.randn(rows, 512, device=device)
+                self._assert_dual_launch(compiled, fn, (y,), y.numel())
+                with _record_tensor_args() as counts:
+                    compiled(y)
+                num_tensor_args[rows] = counts
+
+        # The kernels really differ in persistence and were rebuilt keeping a buffer
+        # one of them would have removed; both get the same buffers.
+        self.assertIn("triton_per_", code)
+        self.assertIn("triton_red_", code)
+        self.assertTrue(rebuilt_keeping)
+        self.assertEqual(num_tensor_args[3], num_tensor_args[256])
+
+    @onlyAccelerator
+    def test_dual_index_dtype_multi_kernel(self, device):
+        """dual_index_dtype_kernels with triton.multi_kernel: each side of the
+        int32/int64 dispatch is itself a multi-kernel (persistent and looped variants),
+        and each input launches only kernels of its side. Same lowered bound as
+        test_dual_index_dtype_reductions."""
+
+        def fn(x):
+            return x.sum(-1), x.argmax(-1)
+
+        # A static reduction size keeps the reduction persistent, so multi_kernel
+        # adds a looped variant on each side of the int32/int64 dispatch.
+        compiled = torch.compile(fn)
+        with (
+            config.patch({"dual_index_dtype_kernels": True, "triton.multi_kernel": 1}),
+            _lowered_int32_limit(),
+        ):
+            x = torch.randn(64, 512, device=device)
+            torch._dynamo.mark_dynamic(x, 0)
+            actual, (code, *_) = run_and_get_code(compiled, x)
+            self.assertEqual(actual, fn(x))
+            for rows in [256, 3]:
+                y = torch.randn(rows, 512, device=device)
+                self._assert_dual_launch(compiled, fn, (y,), y.numel())
+
+        # Each side of the dispatch is a multi-kernel.
+        self.assertIn("multi_kernel_0.run(", code)
+        self.assertIn("multi_kernel_1.run(", code)
+        (entry,) = _debug_get_cache_entry_list(fn.__code__)
+        self.assertNotIn("2147483647", str(entry.guard_manager))
+
+    @onlyAccelerator
+    def test_dual_index_dtype_keeps_pointwise_guard(self, device):
+        """Pointwise kernels are not covered yet: they keep a single int32 kernel and
+        its size guard."""
+
+        def fn(x):
+            return x * 2 + 1
+
+        x = torch.randn(8, 1152, device=device)
+        with config.patch(dual_index_dtype_kernels=True):
+            actual, (code, *_) = run_and_get_code(torch.compile(fn, dynamic=True), x)
+        self.assertEqual(actual, fn(x))
+        guards = str(_debug_get_cache_entry_list(fn.__code__)[0].guard_manager)
+        self.assertIn("<= 2147483647", guards)
+        self.assertNotIn("'xnumel': 'i64'", code)
 
     @onlyAccelerator
     @torch._dynamo.config.patch(
